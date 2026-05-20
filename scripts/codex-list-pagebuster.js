@@ -18,6 +18,10 @@
     timers: new Set(),
     clicked: new WeakSet(),
     scheduled: false,
+    autoExpandEnabled: true,
+    programmaticExpand: false,
+    projectClickListener: null,
+    autoExpandDeadlineMs: Date.now() + 8000,
     fetchPatched: false,
     xhrPatched: false,
     supplementIds: "",
@@ -156,9 +160,36 @@
       .trim();
   }
 
+  function normalizePathForCompare(path) {
+    return normalizeCwd(path)
+      .replace(/[\\/]+$/g, "")
+      .toLowerCase();
+  }
+
   function basename(path) {
     const normalized = normalizeCwd(path);
     return normalized.split(/[\\/]/).filter(Boolean).pop() || normalized || "unknown";
+  }
+
+  function collectVisibleProjectRoots() {
+    return new Set(
+      Array.from(document.querySelectorAll("[data-app-action-sidebar-project-id]"))
+        .map((row) => row.getAttribute("data-app-action-sidebar-project-id"))
+        .map(normalizePathForCompare)
+        .filter(Boolean)
+    );
+  }
+
+  function threadHasVisibleProject(thread, projectRoots) {
+    const cwd = normalizePathForCompare(thread?.cwd);
+    if (!cwd) return false;
+    for (const root of projectRoots) {
+      if (!root) continue;
+      if (cwd === root || cwd.startsWith(`${root}/`) || cwd.startsWith(`${root}\\`)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function collectNativeThreadIds() {
@@ -360,7 +391,8 @@
 
     const threads = readSnapshotThreads();
     const nativeIds = collectNativeThreadIds();
-    const missing = threads.filter((thread) => !nativeIds.has(threadDomId(thread)));
+    const projectRoots = collectVisibleProjectRoots();
+    const missing = threads.filter((thread) => !nativeIds.has(threadDomId(thread)) && !threadHasVisibleProject(thread, projectRoots));
     const nextIds = missing.map((thread) => threadDomId(thread)).join("|");
     const existing = document.querySelector(SUPPLEMENT_SELECTOR);
 
@@ -402,13 +434,18 @@
   function expandNativeProjectLists(reason = "scan") {
     let clicked = 0;
     const lists = Array.from(document.querySelectorAll(PROJECT_LIST_SELECTOR));
-    for (const list of lists) {
-      const buttons = Array.from(list.querySelectorAll("button")).filter(isExpandButton);
-      for (const button of buttons) {
-        state.clicked.add(button);
-        button.click();
-        clicked += 1;
+    state.programmaticExpand = true;
+    try {
+      for (const list of lists) {
+        const buttons = Array.from(list.querySelectorAll("button")).filter(isExpandButton);
+        for (const button of buttons) {
+          state.clicked.add(button);
+          button.click();
+          clicked += 1;
+        }
       }
+    } finally {
+      state.programmaticExpand = false;
     }
     if (clicked || reason === "manual") {
       log("native expand", {
@@ -423,16 +460,46 @@
     return clicked;
   }
 
+  function autoExpandNativeProjectLists(reason) {
+    const withinAutoWindow = Date.now() <= state.autoExpandDeadlineMs;
+    if (!state.autoExpandEnabled || !withinAutoWindow) {
+      renderSupplementalHistory();
+      return 0;
+    }
+    return expandNativeProjectLists(reason);
+  }
+
   function scheduleExpand(reason) {
     if (state.scheduled) return;
     state.scheduled = true;
     requestAnimationFrame(() => {
       state.scheduled = false;
-      expandNativeProjectLists(reason);
+      if (reason !== "manual") {
+        const withinAutoWindow = Date.now() <= state.autoExpandDeadlineMs;
+        if (state.autoExpandEnabled && withinAutoWindow) {
+          autoExpandNativeProjectLists(reason);
+          return;
+        }
+      }
+      renderSupplementalHistory();
     });
   }
 
   function installObserver() {
+    state.projectClickListener = (event) => {
+      if (state.programmaticExpand) return;
+      const target = event.target;
+      const button = target instanceof Element ? target.closest(`${PROJECT_LIST_SELECTOR} button`) : null;
+      if (button) {
+        state.autoExpandEnabled = false;
+      }
+    };
+    document.addEventListener(
+      "click",
+      state.projectClickListener,
+      true
+    );
+
     state.observer = new MutationObserver(() => scheduleExpand("mutation"));
     state.observer.observe(document.documentElement, {
       childList: true,
@@ -442,6 +509,9 @@
 
   function stop() {
     if (state.observer) state.observer.disconnect();
+    if (state.projectClickListener) {
+      document.removeEventListener("click", state.projectClickListener, true);
+    }
     for (const timer of state.timers) window.clearTimeout(timer);
     state.timers.clear();
     if (state.fetchPatched) window.fetch = state.originalFetch;
@@ -472,7 +542,7 @@
   log("loaded", window[SCRIPT_KEY].status());
   scheduleExpand("load");
   renderSupplementalHistory();
-  [250, 750, 1500, 3000, 6000, 10000].forEach((ms) => {
-    setManagedTimeout(() => expandNativeProjectLists(`timer:${ms}`), ms);
+  [250, 750, 1500, 3000].forEach((ms) => {
+    setManagedTimeout(() => autoExpandNativeProjectLists(`timer:${ms}`), ms);
   });
 })();
