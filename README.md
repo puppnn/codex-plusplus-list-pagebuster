@@ -1,6 +1,6 @@
 # Codex++ 会话列表突破脚本
 
-这是一个用于 [Codex++](https://github.com/b-nnett/codex-plusplus) 的用户脚本，目标是在 Codex Desktop 左侧原生会话列表里尽量显示更多本地历史会话，并让补充出来的旧会话可以正常点击打开。
+这是一个用于 [Codex++](https://github.com/BigPizzaV3/CodexPlusPlus) 的用户脚本，目标是在 Codex Desktop 左侧原生会话列表里尽量显示更多本地历史会话，并让补充出来的旧会话可以正常点击打开。
 
 > 这不是 OpenAI Codex 官方功能，也不是 Codex++ 主项目内置功能。它依赖 Codex Desktop 当前版本的前端内部接口，升级 Codex 后可能需要调整。
 
@@ -128,7 +128,7 @@ window.__codexListPagebuster.stop()
 
 Codex++ 主项目：
 
-- <https://github.com/b-nnett/codex-plusplus>
+- <https://github.com/BigPizzaV3/CodexPlusPlus>
 
 ## License
 
