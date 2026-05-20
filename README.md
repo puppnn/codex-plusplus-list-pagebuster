@@ -4,6 +4,19 @@
 
 > 这不是 OpenAI Codex 官方功能，也不是 Codex++ 主项目内置功能。它依赖 Codex Desktop 当前版本的前端内部接口，升级 Codex 后可能需要调整。
 
+## 和 codex-provider-sync 的互补关系
+
+[Dailin521/codex-provider-sync](https://github.com/Dailin521/codex-provider-sync) 主要解决的是 Codex 本地历史里的 provider 元数据同步问题：例如不同官方、第三方、自定义第三方 provider 配置之间，历史会话因为 `model_provider`、`source` 或 rollout 元数据不一致而不可见。
+
+本项目解决的是另一层问题：即使 provider 元数据已经同步好了，Codex Desktop 前端左侧会话列表仍可能只加载约 50 条 recent 会话，或者旧会话虽然能查到，但点击后详情页一直停在加载状态。
+
+所以两者是互补的：
+
+- `codex-provider-sync`：修正本地数据库 / rollout 文件中的 provider 元数据，让会话具备被当前配置识别的条件。
+- `codex-plusplus-list-pagebuster`：通过 Codex++ 用户脚本突破 Codex Desktop 前端列表加载与旧会话恢复限制，让更多历史会话直接出现在原生侧边栏里，并让兜底补充行可以正常打开。
+
+如果你的问题是“切换 provider 后会话完全看不到”，先用 `codex-provider-sync` 更合适；如果数据库里已有会话，但 Codex Desktop 左侧列表仍只显示前几十条，或者补出来的旧会话点开一直转圈，本脚本更对症。
+
 ## 解决什么问题
 
 Codex Desktop 的会话列表有时只加载最近约 50 条会话。即使本地数据库和 rollout 文件里还有更多历史会话，左侧列表也不一定显示。
