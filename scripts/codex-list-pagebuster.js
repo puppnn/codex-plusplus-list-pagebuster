@@ -22,6 +22,7 @@
     programmaticExpand: false,
     projectClickListener: null,
     autoExpandDeadlineMs: Date.now() + 8000,
+    lastProjectRoots: new Set(),
     fetchPatched: false,
     xhrPatched: false,
     supplementIds: "",
@@ -171,13 +172,41 @@
     return normalized.split(/[\\/]/).filter(Boolean).pop() || normalized || "unknown";
   }
 
-  function collectVisibleProjectRoots() {
+  function rememberProjectRoots(roots) {
+    const next = new Set(state.lastProjectRoots);
+    for (const root of roots) {
+      if (root) next.add(root);
+    }
+    state.lastProjectRoots = next;
+    return next;
+  }
+
+  function collectSnapshotProjectRoots() {
     return new Set(
+      readSnapshotThreads()
+        .map((thread) => normalizePathForCompare(thread.cwd))
+        .filter(Boolean)
+    );
+  }
+
+  function collectVisibleProjectRoots() {
+    const roots = new Set(
       Array.from(document.querySelectorAll("[data-app-action-sidebar-project-id]"))
         .map((row) => row.getAttribute("data-app-action-sidebar-project-id"))
         .map(normalizePathForCompare)
         .filter(Boolean)
     );
+    if (roots.size > 0) {
+      return rememberProjectRoots(roots);
+    }
+    if (state.lastProjectRoots.size > 0) {
+      return state.lastProjectRoots;
+    }
+    const snapshotRoots = collectSnapshotProjectRoots();
+    if (snapshotRoots.size > 0 && document.querySelector(PROJECT_LIST_SELECTOR)) {
+      return rememberProjectRoots(snapshotRoots);
+    }
+    return snapshotRoots;
   }
 
   function threadHasVisibleProject(thread, projectRoots) {
