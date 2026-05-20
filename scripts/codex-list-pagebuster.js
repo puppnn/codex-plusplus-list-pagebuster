@@ -138,7 +138,14 @@
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       const threads = raw ? JSON.parse(raw) : [];
-      return Array.isArray(threads) ? threads.filter((thread) => thread && typeof thread.id === "string") : [];
+      return Array.isArray(threads)
+        ? threads.filter((thread) => {
+            if (!thread || typeof thread.id !== "string") return false;
+            const title = String(thread.title || "").trim();
+            const cwd = normalizeCwd(thread.cwd);
+            return Boolean(title || cwd);
+          })
+        : [];
     } catch (error) {
       log("snapshot read failed", String(error));
       return [];
