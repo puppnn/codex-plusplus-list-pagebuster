@@ -189,6 +189,25 @@
     );
   }
 
+  function writeSnapshotThreads(threads) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(threads));
+    } catch (error) {
+      log("snapshot write failed", String(error));
+    }
+  }
+
+  function pruneSnapshotThreads(idsToRemove) {
+    const removeSet = new Set(Array.from(idsToRemove).map(threadRawId).filter(Boolean));
+    if (removeSet.size === 0) return 0;
+    const threads = readSnapshotThreads();
+    const next = threads.filter((thread) => !removeSet.has(threadRawId(thread)));
+    if (next.length === threads.length) return 0;
+    writeSnapshotThreads(next);
+    state.supplementIds = "";
+    return threads.length - next.length;
+  }
+
   function collectVisibleProjectRoots() {
     const roots = new Set(
       Array.from(document.querySelectorAll("[data-app-action-sidebar-project-id]"))
@@ -294,6 +313,17 @@
         hostId: "local",
         conversationIds: ids
       });
+      const foundSet = new Set(Array.isArray(found) ? found.map(threadRawId).filter(Boolean) : []);
+      const staleIds = ids.filter((id) => !foundSet.has(id));
+      if (staleIds.length > 0) {
+        const removed = pruneSnapshotThreads(staleIds);
+        if (removed > 0) {
+          log("stale snapshot pruned", {
+            removed,
+            stale: staleIds.length
+          });
+        }
+      }
       log("native cache batch load", {
         requested: ids.length,
         found: Array.isArray(found) ? found.length : null
