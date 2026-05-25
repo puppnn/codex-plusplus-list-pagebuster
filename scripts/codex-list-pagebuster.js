@@ -5,9 +5,18 @@
   const PROJECT_LIST_SELECTOR = "[data-app-action-sidebar-project-list-id]";
   const THREAD_SELECTOR = "[data-app-action-sidebar-thread-id]";
   const SUPPLEMENT_SELECTOR = "[data-clpb-history-section]";
+  const MANAGED_ROW_SELECTOR = "[data-clpb-managed-row]";
+  const PROJECT_SUPPLEMENT_ITEM_SELECTOR = "[data-clpb-project-supplemental-item]";
   const EXPAND_TEXT = /^(?:\u5c55\u5f00\u663e\u793a|\u663e\u793a\u66f4\u591a|Show more|Show all)$/i;
   const KEYWORDS = /(?:thread|threads|session|sessions|history|recent|conversation|project)/i;
   const LIMIT_KEYS = ["limit", "pageSize", "page_size", "first", "take", "perPage", "per_page", "count", "max", "size", "n"];
+  const ARCHIVED_IDS_KEY = "__codexListPagebusterArchivedIds";
+  const HIDDEN_IDS_KEY = "__codexListPagebusterHiddenIds";
+  const SIGNALS_MODULE_RE = /(?:\.\/)?assets\/app-server-manager-signals-[A-Za-z0-9_-]+\.js/g;
+  const SIGNALS_MODULE_FALLBACKS = [
+    "./assets/app-server-manager-signals-Csopz8aM.js",
+    "./assets/app-server-manager-signals-zAr_ejg8.js"
+  ];
 
   if (window[SCRIPT_KEY]?.stop) {
     window[SCRIPT_KEY].stop();
@@ -28,6 +37,9 @@
     supplementIds: "",
     promoteInFlight: false,
     promotedKey: "",
+    internalActionModulePromise: null,
+    snapshotRefreshInFlight: false,
+    lastSnapshotRefreshAt: 0,
     originalFetch: window.fetch,
     originalXhrOpen: XMLHttpRequest.prototype.open,
     originalXhrSend: XMLHttpRequest.prototype.send
@@ -138,9 +150,13 @@
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       const threads = raw ? JSON.parse(raw) : [];
+      const archivedIds = readArchivedIds();
+      const hiddenIds = readHiddenIds();
       return Array.isArray(threads)
         ? threads.filter((thread) => {
             if (!thread || typeof thread.id !== "string") return false;
+            if (archivedIds.has(threadRawId(thread))) return false;
+            if (hiddenIds.has(threadRawId(thread))) return false;
             const title = String(thread.title || "").trim();
             const cwd = normalizeCwd(thread.cwd);
             return Boolean(title || cwd);
@@ -150,6 +166,40 @@
       log("snapshot read failed", String(error));
       return [];
     }
+  }
+
+  function readIdSet(key) {
+    try {
+      const raw = localStorage.getItem(key);
+      const ids = raw ? JSON.parse(raw) : [];
+      return new Set(Array.isArray(ids) ? ids.map(threadRawId).filter(Boolean) : []);
+    } catch {
+      return new Set();
+    }
+  }
+
+  function writeIdSet(key, ids, label) {
+    try {
+      localStorage.setItem(key, JSON.stringify(Array.from(ids)));
+    } catch (error) {
+      log(`${label} ids write failed`, String(error));
+    }
+  }
+
+  function readArchivedIds() {
+    return readIdSet(ARCHIVED_IDS_KEY);
+  }
+
+  function writeArchivedIds(ids) {
+    writeIdSet(ARCHIVED_IDS_KEY, ids, "archived");
+  }
+
+  function readHiddenIds() {
+    return readIdSet(HIDDEN_IDS_KEY);
+  }
+
+  function writeHiddenIds(ids) {
+    writeIdSet(HIDDEN_IDS_KEY, ids, "hidden");
   }
 
   function threadRawId(threadOrId) {
@@ -198,7 +248,13 @@
 
   function writeSnapshotThreads(threads) {
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(threads));
+      const archivedIds = readArchivedIds();
+      const hiddenIds = readHiddenIds();
+      const activeThreads = threads.filter((thread) => {
+        const rawId = threadRawId(thread);
+        return !archivedIds.has(rawId) && !hiddenIds.has(rawId);
+      });
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(activeThreads));
     } catch (error) {
       log("snapshot write failed", String(error));
     }
@@ -213,6 +269,32 @@
     writeSnapshotThreads(next);
     state.supplementIds = "";
     return threads.length - next.length;
+  }
+
+  function rememberArchivedIds(ids) {
+    const archivedIds = readArchivedIds();
+    let changed = false;
+    for (const id of ids) {
+      const rawId = threadRawId(id);
+      if (!rawId || archivedIds.has(rawId)) continue;
+      archivedIds.add(rawId);
+      changed = true;
+    }
+    if (changed) writeArchivedIds(archivedIds);
+    return archivedIds;
+  }
+
+  function rememberHiddenIds(ids) {
+    const hiddenIds = readHiddenIds();
+    let changed = false;
+    for (const id of ids) {
+      const rawId = threadRawId(id);
+      if (!rawId || hiddenIds.has(rawId)) continue;
+      hiddenIds.add(rawId);
+      changed = true;
+    }
+    if (changed) writeHiddenIds(hiddenIds);
+    return hiddenIds;
   }
 
   function collectVisibleProjectRoots() {
@@ -250,7 +332,7 @@
   function collectNativeThreadIds() {
     return new Set(
       Array.from(document.querySelectorAll(THREAD_SELECTOR))
-        .filter((row) => !row.closest(SUPPLEMENT_SELECTOR))
+        .filter((row) => !row.closest(SUPPLEMENT_SELECTOR) && !row.closest(MANAGED_ROW_SELECTOR))
         .map((row) => row.getAttribute("data-app-action-sidebar-thread-id"))
         .filter(Boolean)
     );
@@ -292,20 +374,292 @@
   }
 
   async function callInternalAction(type, payload) {
-    const mod = await import("./assets/app-server-manager-signals-zAr_ejg8.js");
-    const sendRequest = mod.ln;
-    if (typeof sendRequest !== "function") {
-      throw new Error("Codex internal request helper is unavailable");
-    }
+    const sendRequest = await loadInternalActionModule();
     return sendRequest(type, payload);
   }
 
+  function findInternalRequestHelper(mod) {
+    const preferred = ["ts", "It", "ln"];
+    for (const key of preferred) {
+      const value = mod?.[key];
+      if (typeof value !== "function") continue;
+      const source = Function.prototype.toString.call(value);
+      if (/sendRequest\s*\(/.test(source)) return { key, fn: value };
+    }
+
+    for (const key of Object.keys(mod || {})) {
+      const value = mod[key];
+      if (typeof value !== "function") continue;
+      let source = "";
+      try {
+        source = Function.prototype.toString.call(value);
+      } catch {
+        continue;
+      }
+      if (/sendRequest\s*\(/.test(source)) return { key, fn: value };
+    }
+    return null;
+  }
+
+  function normalizeSignalsModulePath(path) {
+    if (!path) return "";
+    if (/^https?:|^app:|^file:/i.test(path)) return path;
+    const relative = path.replace(/^\.\//, "");
+    return relative.startsWith("assets/") ? `./${relative}` : "";
+  }
+
+  function collectSignalsModuleCandidatesFromText(text) {
+    const candidates = [];
+    if (typeof text !== "string" || !text) return candidates;
+    for (const match of text.matchAll(SIGNALS_MODULE_RE)) {
+      const candidate = normalizeSignalsModulePath(match[0]);
+      if (candidate) candidates.push(candidate);
+    }
+    return candidates;
+  }
+
+  function collectSignalsModuleCandidatesFromRuntime() {
+    const candidates = new Set(SIGNALS_MODULE_FALLBACKS);
+    const add = (value) => {
+      const candidate = normalizeSignalsModulePath(value);
+      if (candidate) candidates.add(candidate);
+    };
+
+    collectSignalsModuleCandidatesFromText(document.documentElement?.outerHTML || "").forEach(add);
+
+    for (const script of document.querySelectorAll("script[src]")) {
+      add(script.getAttribute("src") || "");
+    }
+
+    try {
+      for (const entry of performance.getEntriesByType("resource")) {
+        const name = String(entry.name || "");
+        if (name.includes("app-server-manager-signals-")) add(name);
+      }
+    } catch {}
+
+    return Array.from(candidates);
+  }
+
+  async function discoverSignalsModuleCandidates() {
+    const candidates = new Set(collectSignalsModuleCandidatesFromRuntime());
+    const scriptsToScan = new Set(
+      Array.from(document.querySelectorAll("script[src]"))
+        .map((script) => script.getAttribute("src"))
+        .filter(Boolean)
+    );
+
+    try {
+      for (const entry of performance.getEntriesByType("resource")) {
+        const name = String(entry.name || "");
+        if (/\.js(?:$|\?)/.test(name)) scriptsToScan.add(name);
+      }
+    } catch {}
+
+    for (const scriptUrl of scriptsToScan) {
+      try {
+        const response = await fetch(scriptUrl);
+        if (!response.ok) continue;
+        collectSignalsModuleCandidatesFromText(await response.text()).forEach((candidate) => {
+          candidates.add(candidate);
+        });
+      } catch {}
+    }
+
+    return Array.from(candidates);
+  }
+
+  async function loadInternalActionModule() {
+    if (!state.internalActionModulePromise) {
+      state.internalActionModulePromise = (async () => {
+        const candidates = await discoverSignalsModuleCandidates();
+        let lastError = null;
+        for (const candidate of candidates) {
+          try {
+            const mod = await import(candidate);
+            const helper = findInternalRequestHelper(mod);
+            if (helper) {
+              log("internal action module", candidate, helper.key);
+              return helper.fn;
+            }
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error("Codex internal request helper module was not found");
+      })().catch((error) => {
+        state.internalActionModulePromise = null;
+        throw error;
+      });
+    }
+    return state.internalActionModulePromise;
+  }
+
+  function sourceLooksInternal(source) {
+    if (source == null) return false;
+    if (typeof source === "string") {
+      return /(?:guardian|subagent|background|approval|review)/i.test(source);
+    }
+    if (typeof source !== "object") return false;
+    if (source.subagent != null) return true;
+    if (source.parentThreadId != null) return true;
+    if (source.sourceThreadId != null) return true;
+    try {
+      return /(?:guardian|subagent|background|approval|review)/i.test(JSON.stringify(source));
+    } catch {
+      return false;
+    }
+  }
+
+  function shouldHideThread(thread) {
+    if (!thread || typeof thread !== "object") return false;
+    if (
+      thread.archived === true ||
+      thread.archived === 1 ||
+      thread.archived === "true" ||
+      thread.status === "archived" ||
+      thread.status?.type === "archived"
+    ) {
+      return true;
+    }
+    const knownPath = String(thread.path || thread.rolloutPath || thread.savedPath || "").replaceAll("\\", "/");
+    if (/\/archived_sessions\//i.test(knownPath)) return true;
+    if (sourceLooksInternal(thread.source)) return true;
+    if (sourceLooksInternal(thread.threadSource)) return true;
+    if (sourceLooksInternal(thread.originator)) return true;
+    if (typeof thread.agentRole === "string" && /(?:guardian|subagent|background|approval|review)/i.test(thread.agentRole)) return true;
+    if (typeof thread.agentNickname === "string" && /(?:guardian|subagent|background|approval|review)/i.test(thread.agentNickname)) return true;
+    return false;
+  }
+
+  function normalizeListedThread(thread) {
+    if (!thread || typeof thread.id !== "string") return null;
+    if (shouldHideThread(thread)) return null;
+    const cwd = normalizeCwd(thread.cwd);
+    const title = String(thread.name || thread.title || thread.preview || "").trim();
+    if (!cwd && !title) return null;
+    return {
+      id: threadRawId(thread.id),
+      title: title || thread.id,
+      cwd
+    };
+  }
+
+  function mergeSnapshotThreads(nextThreads) {
+    const archivedIds = readArchivedIds();
+    const hiddenIds = readHiddenIds();
+    const byId = new Map();
+    for (const thread of readSnapshotThreads()) {
+      const rawId = threadRawId(thread);
+      if (!archivedIds.has(rawId) && !hiddenIds.has(rawId)) byId.set(rawId, thread);
+    }
+    for (const thread of nextThreads) {
+      const normalized = normalizeListedThread(thread);
+      if (!normalized) continue;
+      const rawId = threadRawId(normalized);
+      if (archivedIds.has(rawId) || hiddenIds.has(rawId)) continue;
+      const existing = byId.get(normalized.id);
+      byId.set(normalized.id, {
+        ...existing,
+        ...normalized
+      });
+    }
+    const merged = Array.from(byId.values()).filter((thread) => threadRawId(thread));
+    writeSnapshotThreads(merged);
+    return merged.length;
+  }
+
+  async function sendCliRequest(method, params, options = {}) {
+    return callInternalAction("send-cli-request-for-host", {
+      hostId: "local",
+      method,
+      params,
+      timeoutMs: options.timeoutMs
+    });
+  }
+
+  async function listThreadsFromCli({ archived, limit = TARGET }) {
+    const threads = [];
+    let cursor = null;
+    for (let page = 0; page < 20 && threads.length < limit; page += 1) {
+      const result = await sendCliRequest(
+        "thread/list",
+        {
+          archived,
+          cursor,
+          limit: 50,
+          modelProviders: null,
+          sortKey: "updated_at"
+        },
+        { timeoutMs: 12000 }
+      );
+      const data = Array.isArray(result?.data) ? result.data : [];
+      threads.push(...data);
+      cursor = result?.nextCursor || null;
+      if (!cursor || data.length === 0) break;
+    }
+    return threads;
+  }
+
+  async function refreshSnapshotFromCli(force = false) {
+    const now = Date.now();
+    if (state.snapshotRefreshInFlight) return;
+    if (!force && now - state.lastSnapshotRefreshAt < 30000) return;
+    state.snapshotRefreshInFlight = true;
+    state.lastSnapshotRefreshAt = now;
+    try {
+      const [threads, archivedThreads] = await Promise.all([
+        listThreadsFromCli({ archived: false }),
+        listThreadsFromCli({ archived: true })
+      ]);
+      const archivedIds = rememberArchivedIds(archivedThreads.map(threadRawId));
+      const hiddenIds = rememberHiddenIds(threads.filter(shouldHideThread).map(threadRawId));
+      const idsToRemove = new Set([...archivedIds, ...hiddenIds]);
+      const removedArchived = pruneSnapshotThreads(idsToRemove);
+      const count = mergeSnapshotThreads(threads);
+      log("snapshot refreshed", {
+        fetched: threads.length,
+        archived: archivedThreads.length,
+        hidden: hiddenIds.size,
+        removedArchived,
+        snapshot: count
+      });
+      state.supplementIds = "";
+      scheduleExpand("snapshot-refresh");
+    } catch (error) {
+      log("snapshot refresh failed", String(error));
+    } finally {
+      state.snapshotRefreshInFlight = false;
+    }
+  }
+
   async function loadThreadIntoNativeCache(rawId) {
-    const found = await callInternalAction("load-recent-conversation-ids-for-host", {
+    await callInternalAction("load-recent-conversation-ids-for-host", {
       hostId: "local",
       conversationIds: [rawId]
     });
-    return Array.isArray(found) && found.includes(rawId);
+    const result = await sendCliRequest(
+      "thread/read",
+      {
+        threadId: rawId,
+        includeTurns: false
+      },
+      { timeoutMs: 12000 }
+    ).catch(() => null);
+    const rawThread = result?.thread || result;
+    if (rawThread?.archived === true || rawThread?.status?.type === "archived") {
+      rememberArchivedIds([rawId]);
+      pruneSnapshotThreads([rawId]);
+      return false;
+    }
+    if (shouldHideThread(rawThread)) {
+      rememberHiddenIds([rawId]);
+      pruneSnapshotThreads([rawId]);
+      return false;
+    }
+    const thread = normalizeListedThread(rawThread);
+    if (thread) mergeSnapshotThreads([thread]);
+    return true;
   }
 
   async function promoteMissingToNative(missing) {
@@ -316,11 +670,16 @@
     state.promoteInFlight = true;
     state.promotedKey = key;
     try {
-      const found = await callInternalAction("load-recent-conversation-ids-for-host", {
-        hostId: "local",
-        conversationIds: ids
-      });
-      const foundSet = new Set(Array.isArray(found) ? found.map(threadRawId).filter(Boolean) : []);
+      const results = await Promise.all(
+        ids.map(async (id) => {
+          try {
+            return (await loadThreadIntoNativeCache(id)) ? id : null;
+          } catch {
+            return null;
+          }
+        })
+      );
+      const foundSet = new Set(results.filter(Boolean));
       const staleIds = ids.filter((id) => !foundSet.has(id));
       if (staleIds.length > 0) {
         const removed = pruneSnapshotThreads(staleIds);
@@ -331,17 +690,61 @@
           });
         }
       }
-      log("native cache batch load", {
+      log("thread metadata check", {
         requested: ids.length,
-        found: Array.isArray(found) ? found.length : null
+        found: foundSet.size
       });
-      setManagedTimeout(() => scheduleExpand("native-cache-batch"), 250);
+      setManagedTimeout(() => scheduleExpand("metadata-check"), 250);
     } catch (error) {
       state.promotedKey = "";
-      log("native cache batch load failed", String(error));
+      log("thread metadata check failed", String(error));
     } finally {
       state.promoteInFlight = false;
     }
+  }
+
+  function findNativeThreadRow(localId) {
+    return Array.from(document.querySelectorAll(`[data-app-action-sidebar-thread-id="${CSS.escape(localId)}"]`))
+      .find((row) => row instanceof HTMLElement && !row.hasAttribute("data-clpb-managed-row") && !row.closest(SUPPLEMENT_SELECTOR));
+  }
+
+  function getReactPropsKey(element) {
+    return Object.keys(element).find((key) => key.startsWith("__reactProps"));
+  }
+
+  function clickNativeThreadRow(localId) {
+    const row = findNativeThreadRow(localId);
+    if (!row) return false;
+
+    const reactPropsKey = getReactPropsKey(row);
+    const onClick = reactPropsKey ? row[reactPropsKey]?.onClick : null;
+    if (typeof onClick === "function") {
+      const event = {
+        currentTarget: row,
+        target: row,
+        defaultPrevented: false,
+        preventDefault() {
+          this.defaultPrevented = true;
+        },
+        stopPropagation() {
+          this.propagationStopped = true;
+        }
+      };
+      onClick(event);
+      return true;
+    }
+
+    row.click();
+    return true;
+  }
+
+  async function waitForNativeThreadRow(localId, timeoutMs = 5000) {
+    const startedAt = Date.now();
+    while (Date.now() - startedAt < timeoutMs) {
+      if (findNativeThreadRow(localId)) return true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    return false;
   }
 
   async function openThread(thread) {
@@ -357,13 +760,17 @@
     }
 
     try {
+      const cwd = normalizeCwd(thread.cwd) || "/";
       await callInternalAction("maybe-resume-conversation", {
         hostId: "local",
         conversationId: rawId,
         model: null,
+        serviceTier: null,
         reasoningEffort: null,
         workspaceRoots: [cwd],
+        permissions: null,
         collaborationMode: null,
+        showThreadGoalResumeConfirmation: true,
         showPausedGoalResumeConfirmation: true
       });
       log("thread resumed", rawId);
@@ -375,6 +782,15 @@
       await loadThreadIntoNativeCache(rawId);
     } catch (error) {
       log("native cache reload failed", rawId, String(error));
+    }
+
+    scheduleExpand("open-thread");
+
+    if (await waitForNativeThreadRow(localId)) {
+      if (clickNativeThreadRow(localId)) {
+        log("native row clicked", rawId);
+        return;
+      }
     }
 
     try {
@@ -399,7 +815,7 @@
     }
   }
 
-  function makeSupplementalRow(thread) {
+  function makeSupplementalRow(thread, options = {}) {
     const threadId = threadDomId(thread);
     const titleText = thread.title || "Untitled thread";
 
@@ -407,6 +823,7 @@
     item.className = "after:block after:h-px after:content-[''] last:after:hidden";
     item.setAttribute("role", "listitem");
     item.setAttribute("data-clpb-supplemental-item", "");
+    if (options.project) item.setAttribute("data-clpb-project-supplemental-item", "");
 
     const row = document.createElement("div");
     row.className = "group relative min-h-token-nav-row cursor-interaction rounded-lg px-row-x py-row-y text-sm hover:bg-token-list-hover-background focus-visible:outline-offset-[-2px]";
@@ -417,6 +834,7 @@
     row.setAttribute("data-app-action-sidebar-thread-row", "");
     row.setAttribute("data-app-action-sidebar-thread-title", titleText);
     row.setAttribute("data-clpb-supplemental-row", "true");
+    row.setAttribute("data-clpb-managed-row", "true");
     row.setAttribute("role", "button");
     row.setAttribute("tabindex", "0");
     row.setAttribute("data-state", "closed");
@@ -447,6 +865,37 @@
     return item;
   }
 
+  function getProjectThreadList(projectList) {
+    return projectList.querySelector('[role="list"]') || projectList.querySelector(".flex.flex-col") || projectList;
+  }
+
+  function renderProjectSupplementalHistory(threads, nativeIds) {
+    document.querySelectorAll(PROJECT_SUPPLEMENT_ITEM_SELECTOR).forEach((item) => item.remove());
+
+    let rendered = 0;
+    const seen = new Set();
+    for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
+      const root = normalizePathForCompare(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
+      if (!root) continue;
+      const list = getProjectThreadList(projectList);
+      const matches = threads.filter((thread) => {
+        const id = threadDomId(thread);
+        if (nativeIds.has(id) || seen.has(id)) return false;
+        return threadHasVisibleProject(thread, new Set([root]));
+      });
+      for (const thread of matches) {
+        seen.add(threadDomId(thread));
+        list.appendChild(makeSupplementalRow(thread, { project: true }));
+        rendered += 1;
+      }
+    }
+
+    if (rendered > 0) {
+      log("project supplement rendered", { rendered });
+    }
+    return seen;
+  }
+
   function countExpandButtons() {
     return Array.from(document.querySelectorAll(`${PROJECT_LIST_SELECTOR} button`)).filter(isExpandButton).length;
   }
@@ -458,16 +907,22 @@
     const threads = readSnapshotThreads();
     const nativeIds = collectNativeThreadIds();
     const projectRoots = collectVisibleProjectRoots();
-    const missing = threads.filter((thread) => !nativeIds.has(threadDomId(thread)) && !threadHasVisibleProject(thread, projectRoots));
+    const missingNative = threads.filter((thread) => !nativeIds.has(threadDomId(thread)));
+    const projectSupplementIds = renderProjectSupplementalHistory(missingNative, nativeIds);
+    const missing = missingNative.filter((thread) => {
+      if (projectSupplementIds.has(threadDomId(thread))) return false;
+      return !threadHasVisibleProject(thread, projectRoots);
+    });
     const nextIds = missing.map((thread) => threadDomId(thread)).join("|");
     const existing = document.querySelector(SUPPLEMENT_SELECTOR);
+
+    promoteMissingToNative(missingNative);
 
     if (missing.length === 0) {
       existing?.remove();
       state.supplementIds = "";
       return;
     }
-    promoteMissingToNative(missing);
     if (existing && state.supplementIds === nextIds) return;
 
     existing?.remove();
@@ -597,6 +1052,7 @@
       nativeThreads: collectNativeThreadIds().size,
       supplementThreads: document.querySelectorAll("[data-clpb-supplemental-row]").length,
       snapshotThreads: readSnapshotThreads().length,
+      missingNativeThreads: readSnapshotThreads().filter((thread) => !collectNativeThreadIds().has(threadDomId(thread))).length,
       expandButtons: countExpandButtons(),
       href: location.href
     }),
@@ -606,6 +1062,7 @@
   patchRequests();
   installObserver();
   log("loaded", window[SCRIPT_KEY].status());
+  refreshSnapshotFromCli();
   scheduleExpand("load");
   renderSupplementalHistory();
   [250, 750, 1500, 3000].forEach((ms) => {
