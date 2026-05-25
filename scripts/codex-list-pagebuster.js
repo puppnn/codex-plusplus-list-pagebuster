@@ -869,6 +869,10 @@
     return projectList.querySelector('[role="list"]') || projectList.querySelector(".flex.flex-col") || projectList;
   }
 
+  function projectHasCollapsedThreads(projectList) {
+    return Array.from(projectList.querySelectorAll("button")).some(isExpandButton);
+  }
+
   function renderProjectSupplementalHistory(threads, nativeIds) {
     document.querySelectorAll(PROJECT_SUPPLEMENT_ITEM_SELECTOR).forEach((item) => item.remove());
 
@@ -877,6 +881,7 @@
     for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
       const root = normalizePathForCompare(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
       if (!root) continue;
+      if (projectHasCollapsedThreads(projectList)) continue;
       const list = getProjectThreadList(projectList);
       const matches = threads.filter((thread) => {
         const id = threadDomId(thread);
