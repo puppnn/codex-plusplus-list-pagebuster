@@ -921,17 +921,36 @@
   function renderProjectSupplementalHistory(threads, nativeIds) {
     document.querySelectorAll(PROJECT_SUPPLEMENT_ITEM_SELECTOR).forEach((item) => item.remove());
 
+    const sidebarProjectIds = new Set();
+    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
+      const value = normalizePathForCompare(row.getAttribute("data-app-action-sidebar-project-id"));
+      if (value) sidebarProjectIds.add(value);
+    }
+
     let rendered = 0;
     const seen = new Set();
     for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
       const root = normalizePathForCompare(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
       if (!root) continue;
       if (projectHasCollapsedThreads(projectList)) continue;
+
+      const nestedProjects = [];
+      for (const pid of sidebarProjectIds) {
+        if (pid !== root && pid.startsWith(`${root}/`)) {
+          nestedProjects.push(pid);
+        }
+      }
+
       const list = getProjectThreadList(projectList);
       const matches = threads.filter((thread) => {
         const id = threadDomId(thread);
         if (nativeIds.has(id) || seen.has(id)) return false;
-        return threadHasVisibleProject(thread, new Set([root]));
+        if (!threadHasVisibleProject(thread, new Set([root]))) return false;
+        const cwd = normalizePathForCompare(thread?.cwd);
+        for (const nested of nestedProjects) {
+          if (cwd === nested || cwd.startsWith(`${nested}/`)) return false;
+        }
+        return true;
       });
       for (const thread of matches) {
         seen.add(threadDomId(thread));
