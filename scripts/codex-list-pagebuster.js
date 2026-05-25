@@ -298,12 +298,19 @@
   }
 
   function collectVisibleProjectRoots() {
-    const roots = new Set(
-      Array.from(document.querySelectorAll("[data-app-action-sidebar-project-id]"))
-        .map((row) => row.getAttribute("data-app-action-sidebar-project-id"))
-        .map(normalizePathForCompare)
-        .filter(Boolean)
-    );
+    const roots = new Set();
+    const addRoot = (value) => {
+      const root = normalizePathForCompare(value);
+      if (root) roots.add(root);
+    };
+
+    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
+      addRoot(row.getAttribute("data-app-action-sidebar-project-id"));
+    }
+    for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
+      addRoot(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
+    }
+
     if (roots.size > 0) {
       return rememberProjectRoots(roots);
     }
