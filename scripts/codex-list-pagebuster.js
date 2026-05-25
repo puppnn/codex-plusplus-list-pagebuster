@@ -221,6 +221,7 @@
   function normalizePathForCompare(path) {
     return normalizeCwd(path)
       .replace(/[\\/]+$/g, "")
+      .replaceAll("\\", "/")
       .toLowerCase();
   }
 
@@ -297,6 +298,23 @@
     return hiddenIds;
   }
 
+  function collectSidebarProjectBasenames() {
+    const basenames = new Set();
+    const add = (value) => {
+      const normalized = normalizePathForCompare(value);
+      if (!normalized) return;
+      const base = normalized.split("/").filter(Boolean).pop() || normalized;
+      if (base) basenames.add(base);
+    };
+    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
+      add(row.getAttribute("data-app-action-sidebar-project-id"));
+    }
+    for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
+      add(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
+    }
+    return basenames;
+  }
+
   function collectVisibleProjectRoots() {
     const roots = new Set();
     const addRoot = (value) => {
@@ -304,11 +322,31 @@
       if (root) roots.add(root);
     };
 
-    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
-      addRoot(row.getAttribute("data-app-action-sidebar-project-id"));
-    }
     for (const projectList of document.querySelectorAll(PROJECT_LIST_SELECTOR)) {
       addRoot(projectList.getAttribute("data-app-action-sidebar-project-list-id"));
+    }
+
+    const projectIdValues = [];
+    for (const row of document.querySelectorAll("[data-app-action-sidebar-project-id]")) {
+      const value = row.getAttribute("data-app-action-sidebar-project-id");
+      const normalized = normalizePathForCompare(value);
+      if (normalized) {
+        addRoot(normalized);
+        projectIdValues.push(normalized);
+      }
+    }
+
+    const shortNames = projectIdValues.filter((id) => !/[/:]/.test(id));
+    if (shortNames.length > 0) {
+      const shortNameSet = new Set(shortNames);
+      for (const thread of readSnapshotThreads()) {
+        const cwd = normalizePathForCompare(thread.cwd);
+        if (!cwd) continue;
+        const base = cwd.split("/").filter(Boolean).pop() || "";
+        if (base && shortNameSet.has(base)) {
+          addRoot(cwd);
+        }
+      }
     }
 
     if (roots.size > 0) {
@@ -921,9 +959,15 @@
     const projectRoots = collectVisibleProjectRoots();
     const missingNative = threads.filter((thread) => !nativeIds.has(threadDomId(thread)));
     const projectSupplementIds = renderProjectSupplementalHistory(missingNative, nativeIds);
+    const sidebarBasenames = collectSidebarProjectBasenames();
     const missing = missingNative.filter((thread) => {
       if (projectSupplementIds.has(threadDomId(thread))) return false;
-      return !threadHasVisibleProject(thread, projectRoots);
+      if (threadHasVisibleProject(thread, projectRoots)) return false;
+      if (sidebarBasenames.size > 0) {
+        const cwdParts = normalizePathForCompare(thread.cwd).split("/").filter(Boolean);
+        if (cwdParts.some((part) => sidebarBasenames.has(part))) return false;
+      }
+      return true;
     });
     const nextIds = missing.map((thread) => threadDomId(thread)).join("|");
     const existing = document.querySelector(SUPPLEMENT_SELECTOR);
