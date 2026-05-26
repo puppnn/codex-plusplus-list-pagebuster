@@ -10,6 +10,8 @@
   const EXPAND_TEXT = /^(?:\u5c55\u5f00\u663e\u793a|\u663e\u793a\u66f4\u591a|Show more|Show all)$/i;
   const KEYWORDS = /(?:thread|threads|session|sessions|history|recent|conversation|project)/i;
   const LIMIT_KEYS = ["limit", "pageSize", "page_size", "first", "take", "perPage", "per_page", "count", "max", "size", "n"];
+  const MAX_EXTRA_HISTORY_ROWS = 100;
+  const INTERNAL_ACTION_RETRY_MS = 120000;
   const ARCHIVED_IDS_KEY = "__codexListPagebusterArchivedIds";
   const HIDDEN_IDS_KEY = "__codexListPagebusterHiddenIds";
   const SIGNALS_MODULE_RE = /(?:\.\/)?assets\/app-server-manager-signals-[A-Za-z0-9_-]+\.js/g;
@@ -38,8 +40,13 @@
     promoteInFlight: false,
     promotedKey: "",
     internalActionModulePromise: null,
+    internalActionUnavailableUntil: 0,
+    internalActionStatus: "unknown",
+    lastInternalActionError: "",
     snapshotRefreshInFlight: false,
     lastSnapshotRefreshAt: 0,
+    lastSnapshotRefreshError: "",
+    logOnceKeys: new Set(),
     originalFetch: window.fetch,
     originalXhrOpen: XMLHttpRequest.prototype.open,
     originalXhrSend: XMLHttpRequest.prototype.send
@@ -49,6 +56,12 @@
     try {
       console.info("[clpb]", ...args);
     } catch {}
+  }
+
+  function logOnce(key, ...args) {
+    if (state.logOnceKeys.has(key)) return;
+    state.logOnceKeys.add(key);
+    log(...args);
   }
 
   function setManagedTimeout(fn, ms) {
@@ -515,6 +528,9 @@
   }
 
   async function loadInternalActionModule() {
+    if (Date.now() < state.internalActionUnavailableUntil) {
+      throw new Error(state.lastInternalActionError || "Codex internal request helper is temporarily unavailable");
+    }
     if (!state.internalActionModulePromise) {
       state.internalActionModulePromise = (async () => {
         const candidates = await discoverSignalsModuleCandidates();
@@ -525,6 +541,9 @@
             const helper = findInternalRequestHelper(mod);
             if (helper) {
               log("internal action module", candidate, helper.key);
+              state.internalActionStatus = "available";
+              state.lastInternalActionError = "";
+              state.internalActionUnavailableUntil = 0;
               return helper.fn;
             }
           } catch (error) {
@@ -534,6 +553,10 @@
         throw lastError || new Error("Codex internal request helper module was not found");
       })().catch((error) => {
         state.internalActionModulePromise = null;
+        state.internalActionStatus = "unavailable";
+        state.lastInternalActionError = String(error?.message || error);
+        state.internalActionUnavailableUntil = Date.now() + INTERNAL_ACTION_RETRY_MS;
+        logOnce("internal-action-unavailable", "internal action unavailable; using DOM-only fallback", state.lastInternalActionError);
         throw error;
       });
     }
@@ -615,6 +638,9 @@
   }
 
   async function sendCliRequest(method, params, options = {}) {
+    if (Date.now() < state.internalActionUnavailableUntil) {
+      throw new Error(state.lastInternalActionError || "Codex internal request helper is temporarily unavailable");
+    }
     return callInternalAction("send-cli-request-for-host", {
       hostId: "local",
       method,
@@ -650,6 +676,7 @@
     const now = Date.now();
     if (state.snapshotRefreshInFlight) return;
     if (!force && now - state.lastSnapshotRefreshAt < 30000) return;
+    if (Date.now() < state.internalActionUnavailableUntil) return;
     state.snapshotRefreshInFlight = true;
     state.lastSnapshotRefreshAt = now;
     try {
@@ -671,8 +698,10 @@
       });
       state.supplementIds = "";
       scheduleExpand("snapshot-refresh");
+      state.lastSnapshotRefreshError = "";
     } catch (error) {
-      log("snapshot refresh failed", String(error));
+      state.lastSnapshotRefreshError = String(error?.message || error);
+      logOnce("snapshot-refresh-failed", "snapshot refresh failed; keeping existing snapshot", state.lastSnapshotRefreshError);
     } finally {
       state.snapshotRefreshInFlight = false;
     }
@@ -710,6 +739,7 @@
   async function promoteMissingToNative(missing) {
     const ids = Array.from(new Set(missing.map(threadRawId).filter(Boolean)));
     if (ids.length === 0 || state.promoteInFlight) return;
+    if (Date.now() < state.internalActionUnavailableUntil) return;
     const key = ids.join("|");
     if (key === state.promotedKey) return;
     state.promoteInFlight = true;
@@ -742,7 +772,7 @@
       setManagedTimeout(() => scheduleExpand("metadata-check"), 250);
     } catch (error) {
       state.promotedKey = "";
-      log("thread metadata check failed", String(error));
+      logOnce("thread-metadata-check-failed", "thread metadata check failed", String(error?.message || error));
     } finally {
       state.promoteInFlight = false;
     }
@@ -979,7 +1009,7 @@
     const missingNative = threads.filter((thread) => !nativeIds.has(threadDomId(thread)));
     const projectSupplementIds = renderProjectSupplementalHistory(missingNative, nativeIds);
     const sidebarBasenames = collectSidebarProjectBasenames();
-    const missing = missingNative.filter((thread) => {
+    const missingAll = missingNative.filter((thread) => {
       if (projectSupplementIds.has(threadDomId(thread))) return false;
       if (threadHasVisibleProject(thread, projectRoots)) return false;
       if (sidebarBasenames.size > 0) {
@@ -988,6 +1018,8 @@
       }
       return true;
     });
+    const omittedMissing = Math.max(0, missingAll.length - MAX_EXTRA_HISTORY_ROWS);
+    const missing = missingAll.slice(0, MAX_EXTRA_HISTORY_ROWS);
     const nextIds = missing.map((thread) => threadDomId(thread)).join("|");
     const existing = document.querySelector(SUPPLEMENT_SELECTOR);
 
@@ -1010,7 +1042,7 @@
 
     const heading = document.createElement("div");
     heading.className = "flex h-8 items-center px-2 text-xs font-semibold uppercase text-token-text-tertiary";
-    heading.textContent = `Extra history (${missing.length})`;
+    heading.textContent = `Extra history (${missingAll.length}${omittedMissing ? `, showing ${missing.length}` : ""})`;
 
     const list = document.createElement("div");
     list.className = "flex flex-col gap-px";
@@ -1022,6 +1054,7 @@
     scroll.appendChild(section);
     log("supplement rendered", {
       missing: missing.length,
+      omitted: omittedMissing,
       snapshot: threads.length,
       native: nativeIds.size
     });
@@ -1128,6 +1161,11 @@
       supplementThreads: document.querySelectorAll("[data-clpb-supplemental-row]").length,
       snapshotThreads: readSnapshotThreads().length,
       missingNativeThreads: readSnapshotThreads().filter((thread) => !collectNativeThreadIds().has(threadDomId(thread))).length,
+      extraHistoryRows: document.querySelectorAll("[data-clpb-history-section] [data-clpb-managed-row]").length,
+      internalActions: state.internalActionStatus,
+      internalActionRetryInMs: Math.max(0, state.internalActionUnavailableUntil - Date.now()),
+      lastInternalActionError: state.lastInternalActionError,
+      lastSnapshotRefreshError: state.lastSnapshotRefreshError,
       expandButtons: countExpandButtons(),
       href: location.href
     }),
