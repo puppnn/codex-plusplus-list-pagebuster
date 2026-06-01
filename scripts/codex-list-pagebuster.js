@@ -39,6 +39,7 @@
     supplementIds: "",
     promoteInFlight: false,
     promotedKey: "",
+    nextPromoteAt: 0,
     internalActionModulePromise: null,
     internalActionUnavailableUntil: 0,
     internalActionStatus: "unknown",
@@ -70,6 +71,10 @@
       fn();
     }, ms);
     state.timers.add(timer);
+  }
+
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
   function rewriteUrl(raw) {
@@ -755,34 +760,60 @@
     if (ids.length === 0 || state.promoteInFlight) return;
     if (Date.now() < state.internalActionUnavailableUntil) return;
     const key = ids.join("|");
-    if (key === state.promotedKey) return;
+    if (key === state.promotedKey && Date.now() < state.nextPromoteAt) return;
     state.promoteInFlight = true;
     state.promotedKey = key;
+    state.nextPromoteAt = Date.now() + 10000;
     try {
-      const results = await Promise.all(
-        ids.map(async (id) => {
-          try {
-            return (await loadThreadIntoNativeCache(id)) ? id : null;
-          } catch {
-            return null;
+      await callInternalAction("hydrate-pinned-threads", {
+        hostId: "local",
+        threadIds: ids
+      });
+      await delay(8000);
+
+      const nativeIds = collectNativeThreadIds();
+      const foundSet = new Set(ids.filter((id) => nativeIds.has(threadDomId(id))));
+      const missingIds = ids.filter((id) => !foundSet.has(id));
+      const idsToRemove = [];
+      for (const id of missingIds) {
+        try {
+          const result = await sendCliRequest(
+            "thread/read",
+            {
+              threadId: id,
+              includeTurns: false
+            },
+            { timeoutMs: 12000 }
+          );
+          const rawThread = result?.thread || result;
+          if (rawThread?.archived === true || rawThread?.status?.type === "archived") {
+            rememberArchivedIds([id]);
+            idsToRemove.push(id);
+          } else if (shouldHideThread(rawThread)) {
+            rememberHiddenIds([id]);
+            idsToRemove.push(id);
+          } else {
+            const thread = normalizeListedThread(rawThread);
+            if (thread) mergeSnapshotThreads([thread]);
           }
-        })
-      );
-      const foundSet = new Set(results.filter(Boolean));
-      const staleIds = ids.filter((id) => !foundSet.has(id));
-      if (staleIds.length > 0) {
-        rememberHiddenIds(staleIds);
-        const removed = pruneSnapshotThreads(staleIds);
+        } catch (error) {
+          log("thread validation failed", id, String(error?.message || error));
+        }
+      }
+      if (idsToRemove.length > 0) {
+        const removed = pruneSnapshotThreads(idsToRemove);
         if (removed > 0) {
           log("stale snapshot pruned", {
             removed,
-            stale: staleIds.length
+            stale: idsToRemove.length
           });
         }
       }
       log("thread metadata check", {
         requested: ids.length,
-        found: foundSet.size
+        found: foundSet.size,
+        pending: missingIds.length,
+        removed: idsToRemove.length
       });
       setManagedTimeout(() => scheduleExpand("metadata-check"), 250);
     } catch (error) {
