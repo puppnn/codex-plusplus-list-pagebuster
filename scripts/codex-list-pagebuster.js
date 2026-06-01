@@ -436,15 +436,27 @@
     return sendRequest(type, payload);
   }
 
-  function findInternalRequestHelper(mod) {
-    const preferred = ["ts", "It", "ln"];
-    for (const key of preferred) {
-      const value = mod?.[key];
-      if (typeof value !== "function") continue;
-      const source = Function.prototype.toString.call(value);
-      if (/sendRequest\s*\(/.test(source)) return { key, fn: value };
-    }
+  function isHighLevelConversationHelper(source) {
+    return /beforeSendRequest|inheritThreadSettings|turnStartParams|thread-follower-start-turn|getStreamRole|workspaceRoots/.test(source);
+  }
 
+  function scoreInternalRequestHelper(key, value, source) {
+    if (!/sendRequest/.test(source)) return 0;
+    if (isHighLevelConversationHelper(source)) return 0;
+
+    let score = 0;
+    if (value.length > 0 && value.length <= 2) score += 20;
+    if (/return\s+[$\w]+\.sendRequest\s*\(\s*[$\w]+\s*,\s*[$\w]+\s*\)/.test(source)) score += 100;
+    if (/function\s+[$\w]+\s*\(\s*[$\w]+\s*,\s*[$\w]+\s*\)\s*\{\s*return\s+[$\w]+\.sendRequest/.test(source)) score += 50;
+    if (/sendRequest\s*=\s*\(\s*[$\w]+\s*,\s*[$\w]+\s*\)\s*=>/.test(source)) score += 40;
+    if (/\bdebug-run-app-action-request\b/.test(source)) score += 30;
+    if (/\bsendRequest\s*\(\s*[$\w]+\s*,\s*[$\w]+\s*\)/.test(source)) score += 10;
+    if (["ts", "It", "ln"].includes(key)) score += 5;
+    return score;
+  }
+
+  function findInternalRequestHelper(mod) {
+    const candidates = [];
     for (const key of Object.keys(mod || {})) {
       const value = mod[key];
       if (typeof value !== "function") continue;
@@ -454,9 +466,11 @@
       } catch {
         continue;
       }
-      if (/sendRequest\s*\(/.test(source)) return { key, fn: value };
+      const score = scoreInternalRequestHelper(key, value, source);
+      if (score > 0) candidates.push({ key, fn: value, score });
     }
-    return null;
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0] || null;
   }
 
   function normalizeSignalsModulePath(path) {
@@ -708,9 +722,9 @@
   }
 
   async function loadThreadIntoNativeCache(rawId) {
-    await callInternalAction("load-recent-conversation-ids-for-host", {
+    await callInternalAction("hydrate-pinned-threads", {
       hostId: "local",
-      conversationIds: [rawId]
+      threadIds: [rawId]
     });
     const result = await sendCliRequest(
       "thread/read",
@@ -733,7 +747,7 @@
     }
     const thread = normalizeListedThread(rawThread);
     if (thread) mergeSnapshotThreads([thread]);
-    return true;
+    return waitForNativeThreadRow(threadDomId(rawId), 3000);
   }
 
   async function promoteMissingToNative(missing) {
@@ -1007,6 +1021,14 @@
     const nativeIds = collectNativeThreadIds();
     const projectRoots = collectVisibleProjectRoots();
     const missingNative = threads.filter((thread) => !nativeIds.has(threadDomId(thread)));
+    promoteMissingToNative(missingNative);
+    if (missingNative.length > 0 && Date.now() >= state.internalActionUnavailableUntil) {
+      document.querySelectorAll(PROJECT_SUPPLEMENT_ITEM_SELECTOR).forEach((item) => item.remove());
+      document.querySelector(SUPPLEMENT_SELECTOR)?.remove();
+      state.supplementIds = "";
+      return;
+    }
+
     const projectSupplementIds = renderProjectSupplementalHistory(missingNative, nativeIds);
     const sidebarBasenames = collectSidebarProjectBasenames();
     const missingAll = missingNative.filter((thread) => {
@@ -1022,8 +1044,6 @@
     const missing = missingAll.slice(0, MAX_EXTRA_HISTORY_ROWS);
     const nextIds = missing.map((thread) => threadDomId(thread)).join("|");
     const existing = document.querySelector(SUPPLEMENT_SELECTOR);
-
-    promoteMissingToNative(missingNative);
 
     if (missing.length === 0) {
       existing?.remove();
