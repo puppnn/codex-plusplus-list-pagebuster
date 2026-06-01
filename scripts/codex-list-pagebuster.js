@@ -771,6 +771,7 @@
       const foundSet = new Set(results.filter(Boolean));
       const staleIds = ids.filter((id) => !foundSet.has(id));
       if (staleIds.length > 0) {
+        rememberHiddenIds(staleIds);
         const removed = pruneSnapshotThreads(staleIds);
         if (removed > 0) {
           log("stale snapshot pruned", {
