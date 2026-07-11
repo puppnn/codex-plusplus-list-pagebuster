@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> Maintenance status: Codex now natively supports showing more than 50 history sessions, so this project is no longer maintained.
+>
+> This repository is kept only as a historical implementation reference. It will not be adapted for newer Codex Desktop / Codex++ releases, and continued installation is no longer recommended.
+
 # Codex++ List Pagebuster
 
 A third-party user script for [Codex++](https://github.com/BigPizzaV3/CodexPlusPlus). It attempts to surface more local Codex Desktop history entries in the native sidebar, and adds an `Extra history` fallback section for sessions that Codex Desktop does not include in its native recent list.

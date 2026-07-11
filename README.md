@@ -1,3 +1,8 @@
+> [!IMPORTANT]
+> 维护状态：Codex 官方已经支持超过 50 条会话历史显示，本项目已停止维护。
+>
+> 本仓库仅作为历史实现参考保留，不再适配新的 Codex Desktop / Codex++ 版本，也不再建议继续安装使用。
+
 # Codex++ 会话列表突破脚本
 
 这是一个用于 [Codex++](https://github.com/BigPizzaV3/CodexPlusPlus) 的用户脚本，目标是在 Codex Desktop 左侧原生会话列表里尽量显示更多本地历史会话，并让补充出来的旧会话可以正常点击打开。
